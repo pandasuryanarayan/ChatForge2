@@ -241,6 +241,8 @@ export const PythonWasmRunner: React.FC<PythonWasmRunnerProps> = ({
   const [replHistory, setReplHistory] = useState<string[]>([]);
   const [historyIdx, setHistoryIdx] = useState<number>(-1);
   const [definedSymbols, setDefinedSymbols] = useState<string[]>([]);
+  const [showStdinInput, setShowStdinInput] = useState(false);
+  const [stdinText, setStdinText] = useState('');
 
   const terminalEndRef = useRef<HTMLDivElement>(null);
   const isRunningRef = useRef(false);
@@ -437,9 +439,26 @@ if "${modName}" in sys.modules:
         py.globals.set('__chatforge_code__', target.content);
         py.globals.set('__chatforge_filename__', entryFile);
         py.globals.set('__chatforge_sibling_modules__', JSON.stringify(siblingModNames));
+        py.globals.set('__chatforge_stdin__', stdinText || '');
 
         const executionScript = `
 import sys, io, ast, traceback, json, js, __main__
+
+class _ChatForgeStdin(io.StringIO):
+    def fileno(self):
+        raise OSError(29, 'I/O error')
+    def flush(self):
+        pass
+
+# Pyodide's virtual FS has no real stdin; swap in an in-memory one so
+# calls to sys.stdin.read(), input(), etc. never hit OSError 29.
+_stdin_obj = _ChatForgeStdin()
+if __chatforge_stdin__:
+    _stdin_obj.write(__chatforge_stdin__)
+    _stdin_obj.seek(0)
+sys.stdin = _stdin_obj
+sys.__stdin__ = _stdin_obj
+
 
 class _PyStreamWriter:
     def __init__(self, is_err=False):
@@ -519,12 +538,10 @@ try:
     # 4. Gather defined functions and variables
     for _k, _v in _globals.items():
         if not _k.startswith("_") and _k not in ("sys", "io", "ast", "json", "js", "__main__"):
-            # Also sync to __main__ so interactive REPL prompt has direct access to them!
             try:
                 setattr(__main__, _k, _v)
             except Exception:
                 pass
-
             if callable(_v):
                 _defined_symbols.append(f"{_k}()")
             else:
@@ -538,6 +555,12 @@ except Exception:
 finally:
     sys.stdout = _orig_stdout
     sys.stderr = _orig_stderr
+    try:
+        _safe_stdin = _ChatForgeStdin()
+        sys.stdin = _safe_stdin
+        sys.__stdin__ = _safe_stdin
+    except Exception:
+        pass
 
 # 5. Capture matplotlib figure if any was created
 _plot_data = None
@@ -679,6 +702,12 @@ json.dumps({
   const handleReplSubmit = async (customCommand?: string) => {
     const command = (customCommand || replInput).trim();
     if (!command) return;
+
+    if (/^\s*(python|python3|pip|pip3)\s+\S+\.py\s*$/.test(command)) {
+      appendOutput('stderr', `[REPL] "${command}" looks like a shell command. Use the "Run" button above to execute a file, or enter Python expressions directly here (e.g. analyze_text("hello")).`);
+      setRuntimeStatus('ready');
+      return;
+    }
 
     if (!customCommand) {
       setReplHistory((prev) => [...prev, command]);
@@ -1153,6 +1182,46 @@ json.dumps({
               <CornerDownLeft className="w-3.5 h-3.5" />
             </button>
           </form>
+        )}
+
+        {/* Stdin Input Toggle & Textarea */}
+        {activeView === 'terminal' && (
+          <div className="border-t border-zinc-800 bg-[#090d13] shrink-0">
+            <button
+              type="button"
+              onClick={() => setShowStdinInput((v) => !v)}
+              className="w-full flex items-center justify-between px-3 py-1.5 text-[11px] text-zinc-400 hover:text-zinc-200 transition cursor-pointer"
+            >
+              <span className="flex items-center gap-1.5">
+                <Terminal className="w-3 h-3" />
+                <span>Stdin Input</span>
+                {stdinText.trim() && (
+                  <span className="text-[10px] text-emerald-400">(filled)</span>
+                )}
+              </span>
+              <span className="text-[10px] text-zinc-500">{showStdinInput ? 'Hide' : 'Show'}</span>
+            </button>
+            {showStdinInput && (
+              <div className="px-3 pb-2">
+                <textarea
+                  value={stdinText}
+                  onChange={(e) => setStdinText(e.target.value)}
+                  placeholder="Enter stdin text for the next run (Ctrl+D / Ctrl+Z will be simulated)..."
+                  className="w-full h-20 bg-zinc-950 border border-zinc-800 rounded-lg p-2 text-zinc-200 font-mono text-xs placeholder:text-zinc-600 focus:outline-none focus:border-emerald-500/60 resize-y"
+                />
+                <div className="flex items-center justify-between mt-1">
+                  <span className="text-[10px] text-zinc-500">This text is sent to sys.stdin before execution.</span>
+                  <button
+                    type="button"
+                    onClick={() => setStdinText('')}
+                    className="text-[10px] text-zinc-400 hover:text-rose-400 transition cursor-pointer"
+                  >
+                    Clear
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         )}
       </div>
 
